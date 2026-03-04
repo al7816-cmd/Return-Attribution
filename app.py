@@ -25,7 +25,7 @@ from matplotlib.ticker import FuncFormatter
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Portfolio Analyzer TEST",
+    page_title="Portfolio Analyzer",
     page_icon="📈",
     layout="wide",
 )
@@ -371,7 +371,7 @@ def _bar_color(val, base):
 # App layout
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.title("📈 Portfolio Analyzer")
+st.title("📈 Portfolio Analyzer TEST")
 st.markdown("Upload your two Fidelity CSV exports below to analyze portfolio performance.")
 
 col_up1, col_up2 = st.columns(2)
