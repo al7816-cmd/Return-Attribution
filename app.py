@@ -25,7 +25,7 @@ from matplotlib.ticker import FuncFormatter
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Portfolio Analyzer",
+    page_title="Portfolio Analyzer TEST",
     page_icon="📈",
     layout="wide",
 )
