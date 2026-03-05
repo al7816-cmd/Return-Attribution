@@ -658,12 +658,17 @@ def load_ff_factors(lookback_years: int) -> pd.DataFrame:
     Returns a DataFrame indexed by month-end date with columns:
         MKT-RF, SMB, HML, WML, RF  (all as decimals, e.g. 0.012)
     """
-    def _fetch_ff_zip(url: str, filename_in_zip: str) -> pd.DataFrame:
+    def _fetch_ff_zip(url: str) -> pd.DataFrame:
         """Download a FF zip, extract the named CSV, parse the monthly table."""
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
         with zipfile.ZipFile(_io.BytesIO(resp.content)) as zf:
-            with zf.open(filename_in_zip) as f:
+            # Don't hardcode the filename — just grab the first .csv/.CSV entry
+            csv_name = next(
+                n for n in zf.namelist()
+                if n.lower().endswith(".csv")
+            )
+            with zf.open(csv_name) as f:
                 raw = f.read().decode("utf-8", errors="replace")
 
         # FF files have a header block of text, then a CSV block, then more text.
@@ -716,13 +721,11 @@ def load_ff_factors(lookback_years: int) -> pd.DataFrame:
     # Fama-French 3-factor monthly
     ff3 = _fetch_ff_zip(
         "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip",
-        "F-F_Research_Data_Factors.CSV",
     )
 
     # Momentum factor monthly
     mom = _fetch_ff_zip(
         "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_CSV.zip",
-        "F-F_Momentum_Factor.CSV",
     )
     # Momentum column may be named "Mom   " — rename to WML
     mom.columns = ["WML"]
