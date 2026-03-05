@@ -398,24 +398,34 @@ if "positions" not in contents or "orders" not in contents:
 pos_filename,  positions_content = contents["positions"]
 ord_filename,  orders_content    = contents["orders"]
 
-st.success(f"Positions: **{pos_filename}**   |   Orders: **{ord_filename}**")
+# ── Extract end date from positions filename ───────────────────────────────────
+# Expected format: Portfolio_Positions_Mar-04-2026.csv
+_date_match = re.search(r"(\w{3}-\d{2}-\d{4})", pos_filename)
+if _date_match:
+    try:
+        end_date = datetime.strptime(_date_match.group(1), "%b-%d-%Y").date()
+    except ValueError:
+        end_date = date.today()
+else:
+    end_date = date.today()
+
+st.success(f"Positions: **{pos_filename}**   |   Orders: **{ord_filename}**   |   End date: **{end_date.strftime('%B %d, %Y')}**")
 
 # ── Parse ─────────────────────────────────────────────────────────────────────
 with st.spinner("Parsing files..."):
     current_positions     = read_positions(positions_content)
     earliest_date, orders = read_orders(orders_content)
-    today                 = date.today()
     starting_portfolio    = build_starting_portfolio(current_positions, orders)
 
 # ── Fridays ───────────────────────────────────────────────────────────────────
 first_friday = prev_friday(earliest_date)
 fridays = []
 f = first_friday
-while f <= today:
+while f <= end_date:
     fridays.append(f)
     f += timedelta(weeks=1)
-if prev_friday(today) not in fridays:
-    fridays.append(prev_friday(today))
+if prev_friday(end_date) not in fridays:
+    fridays.append(prev_friday(end_date))
 fridays = sorted(set(fridays))
 
 # ── Fetch prices ──────────────────────────────────────────────────────────────
@@ -434,7 +444,7 @@ with st.spinner("Fetching price data from Yahoo Finance..."):
     price_data = fetch_prices(
         all_yf_tickers,
         start_str=(first_friday - timedelta(days=7)).strftime("%Y-%m-%d"),
-        end_str=today.strftime("%Y-%m-%d"),
+        end_str=end_date.strftime("%Y-%m-%d"),
     )
 
 # ── Weekly portfolio values ───────────────────────────────────────────────────
@@ -492,10 +502,10 @@ date_range_str = (fridays[0].strftime("%b %d, %Y")
 st.divider()
 st.subheader("Overview")
 
-delta_days = (today - earliest_date).days
+delta_days = (end_date - earliest_date).days
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Start Date",   earliest_date.strftime("%b %d, %Y"))
-m2.metric("End Date",     today.strftime("%b %d, %Y"))
+m2.metric("End Date",     end_date.strftime("%b %d, %Y"))
 m3.metric("Portfolio Return", f"{abs_return*100:+.2f}%")
 
 er_sp = excess_returns.get("S&P 500")
