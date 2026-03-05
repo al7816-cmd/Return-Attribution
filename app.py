@@ -741,7 +741,10 @@ def load_ff_factors(lookback_years: int) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def get_monthly_returns(tickers: tuple, start_str: str, end_str: str) -> pd.DataFrame:
-    """Download monthly closing prices and compute returns for a list of tickers."""
+    """
+    Download monthly closing prices via yfinance and compute simple returns.
+    Reindexes to month-end dates to align with Fama-French factor data.
+    """
     raw = yf.download(
         list(tickers),
         start=start_str,
@@ -757,29 +760,40 @@ def get_monthly_returns(tickers: tuple, start_str: str, end_str: str) -> pd.Data
     if len(tickers) == 1:
         close.columns = list(tickers)
 
+    # yfinance monthly bars are timestamped at month-start; snap to month-end
+    # so they align with the FF factor index (which is month-end)
+    close.index = close.index.to_period("M").to_timestamp("M")
+
     returns = close.pct_change().dropna(how="all")
-    returns.index = returns.index.normalize()
     return returns
 
 
-def run_ff_regression(excess_returns: pd.Series, factors: pd.DataFrame):
+def run_ff_regression(excess_ret: pd.Series, factors: pd.DataFrame):
     """
-    OLS regression of a stock's excess returns on the 4 factors.
-    Returns dict with beta for each factor, alpha, r_squared, and significance flags.
+    OLS regression of excess stock returns on the 4 Fama-French factors.
+    Both series must share a month-end DatetimeIndex.
+    Returns a result dict, or None if fewer than 12 overlapping observations.
     """
-    aligned = factors.join(excess_returns.rename("r"), how="inner").dropna()
-    if len(aligned) < 12:
-        return None   # not enough data
+    # Snap both indexes to period then back to month-end to guarantee alignment
+    excess_ms = excess_ret.copy()
+    excess_ms.index = excess_ms.index.to_period("M").to_timestamp("M")
 
-    X = sm.add_constant(aligned[FACTORS])
-    y = aligned["r"]
+    factors_ms = factors.copy()
+    factors_ms.index = factors_ms.index.to_period("M").to_timestamp("M")
+
+    combined = factors_ms.join(excess_ms.rename("r"), how="inner").dropna()
+    if len(combined) < 12:
+        return None
+
+    X = sm.add_constant(combined[FACTORS])
+    y = combined["r"]
     model = sm.OLS(y, X).fit()
 
-    result = {"alpha": model.params["const"], "r_squared": model.rsquared, "n_obs": len(aligned)}
+    result = {"alpha": model.params["const"], "r_squared": model.rsquared, "n_obs": len(combined)}
     for f in FACTORS:
-        result[f]              = model.params[f]
-        result[f + "_tstat"]   = model.tvalues[f]
-        result[f + "_sig"]     = abs(model.tvalues[f]) > 1.96   # 95% significance
+        result[f]           = model.params[f]
+        result[f + "_tstat"] = model.tvalues[f]
+        result[f + "_sig"]   = abs(model.tvalues[f]) > 1.96
     return result
 
 
@@ -799,8 +813,9 @@ if ff_ok:
         if sym not in ("CASH", "PENDING") and qty > 0
     }
 
-    factor_start = ff_factors.index[0].strftime("%Y-%m-%d")
-    factor_end   = ff_factors.index[-1].strftime("%Y-%m-%d")
+    # Fetch 3 years of monthly data; add a 1-month buffer on each end
+    factor_start = (ff_factors.index[0]  - pd.DateOffset(months=1)).strftime("%Y-%m-%d")
+    factor_end   = (ff_factors.index[-1] + pd.DateOffset(months=2)).strftime("%Y-%m-%d")
 
     with st.spinner("Fetching monthly price history for factor regressions..."):
         monthly_rets = get_monthly_returns(
@@ -809,17 +824,30 @@ if ff_ok:
             end_str   = factor_end,
         )
 
+    # Diagnostics expander — helpful if something still goes wrong
+    with st.expander("Factor regression diagnostics", expanded=False):
+        st.write(f"**FF factors:** {len(ff_factors)} months, "
+                 f"{ff_factors.index[0].date()} → {ff_factors.index[-1].date()}")
+        if not monthly_rets.empty:
+            st.write(f"**Monthly returns:** {len(monthly_rets)} rows, "
+                     f"{monthly_rets.index[0].date()} → {monthly_rets.index[-1].date()}")
+            st.write(f"**Tickers fetched:** {list(monthly_rets.columns)}")
+        else:
+            st.write("**Monthly returns:** empty — yfinance returned no data")
+
     # Run regression for each ticker
-    betas_rows   = []
-    per_ticker   = {}
+    betas_rows = []
+    per_ticker = {}
 
     for sym in sorted(equity_positions.keys()):
-        if sym not in monthly_rets.columns:
+        if monthly_rets.empty or sym not in monthly_rets.columns:
             continue
-        stock_ret    = monthly_rets[sym].dropna()
-        rf           = ff_factors["RF"].reindex(stock_ret.index)
-        excess       = (stock_ret - rf).dropna()
-        result       = run_ff_regression(excess, ff_factors)
+        stock_ret = monthly_rets[sym].dropna()
+        rf        = ff_factors["RF"].copy()
+        rf.index  = rf.index.to_period("M").to_timestamp("M")
+        rf        = rf.reindex(stock_ret.index)
+        excess    = (stock_ret - rf).dropna()
+        result    = run_ff_regression(excess, ff_factors)
         if result is None:
             continue
         per_ticker[sym] = result
