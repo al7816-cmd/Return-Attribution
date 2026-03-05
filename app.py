@@ -18,7 +18,9 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import pandas_datareader as pdr
+import io as _io
+import zipfile
+import requests
 import statsmodels.api as sm
 import streamlit as st
 import yfinance as yf
@@ -531,7 +533,7 @@ with st.expander("Weekly Portfolio Values", expanded=False):
             "Portfolio Value": f"${val:,.2f}",
             "Missing Prices":  ", ".join(missing) if missing else "—",
         })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Section 3 — Current positions
@@ -545,7 +547,7 @@ with st.expander("Current Positions", expanded=False):
             pos_rows.append({"Symbol": sym, "Quantity / Value": f"${qty:,.2f}"})
         else:
             pos_rows.append({"Symbol": sym, "Quantity / Value": f"{qty:,.4f} shares"})
-    st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(pos_rows), width='stretch', hide_index=True)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Section 4 — Order history
@@ -562,7 +564,7 @@ with st.expander("Order History", expanded=False):
             "Quantity": f"{abs(o['quantity']):,.4f}",
             "Amount":   f"${abs(o['amount']):,.2f}" if o["amount"] != 0 else "—",
         })
-    st.dataframe(pd.DataFrame(ord_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(ord_rows), width='stretch', hide_index=True)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Section 5 — Growth of $1 chart
@@ -571,7 +573,7 @@ with st.expander("Order History", expanded=False):
 st.divider()
 st.subheader("Growth of $1")
 fig_growth = make_growth_chart(fridays, growth_portfolio, growth_bench)
-st.pyplot(fig_growth, use_container_width=True)
+st.pyplot(fig_growth, width='stretch')
 plt.close(fig_growth)
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -598,7 +600,7 @@ fig_abs = make_bar_fig(
     ylabel   = "Total Return (%)",
     figsize  = (9, 5.5),
 )
-st.pyplot(fig_abs, use_container_width=True)
+st.pyplot(fig_abs, width='stretch')
 plt.close(fig_abs)
 
 # Excess return charts side by side
@@ -614,7 +616,7 @@ if er_sp is not None:
             ylabel   = "Excess Return (%)",
             figsize  = (6, 5.5),
         )
-        st.pyplot(fig_sp, use_container_width=True)
+        st.pyplot(fig_sp, width='stretch')
         plt.close(fig_sp)
 
 if er_ru is not None:
@@ -628,7 +630,7 @@ if er_ru is not None:
             ylabel   = "Excess Return (%)",
             figsize  = (6, 5.5),
         )
-        st.pyplot(fig_ru, use_container_width=True)
+        st.pyplot(fig_ru, width='stretch')
         plt.close(fig_ru)
 
 
@@ -651,23 +653,86 @@ FACTOR_COLORS  = {"MKT-RF": "#1d4ed8", "SMB": "#b91c1c", "HML": "#15803d", "WML"
 @st.cache_data(show_spinner=False)
 def load_ff_factors(lookback_years: int) -> pd.DataFrame:
     """
-    Download Fama-French 3-factor + momentum monthly data via pandas-datareader.
+    Download Fama-French 3-factor + momentum monthly data directly from
+    Kenneth French's data library (no pandas-datareader needed).
     Returns a DataFrame indexed by month-end date with columns:
         MKT-RF, SMB, HML, WML, RF  (all as decimals, e.g. 0.012)
     """
-    end_dt   = datetime.today()
-    start_dt = end_dt.replace(year=end_dt.year - lookback_years)
+    def _fetch_ff_zip(url: str, filename_in_zip: str) -> pd.DataFrame:
+        """Download a FF zip, extract the named CSV, parse the monthly table."""
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        with zipfile.ZipFile(_io.BytesIO(resp.content)) as zf:
+            with zf.open(filename_in_zip) as f:
+                raw = f.read().decode("utf-8", errors="replace")
 
-    ff3  = pdr.get_data_famafrench("F-F_Research_Data_Factors",  start=start_dt, end=end_dt)[0]
-    mom  = pdr.get_data_famafrench("F-F_Momentum_Factor",         start=start_dt, end=end_dt)[0]
+        # FF files have a header block of text, then a CSV block, then more text.
+        # The monthly data block starts after a blank line following the header
+        # and ends at the next blank line.
+        lines = raw.splitlines()
+        blocks = []
+        current = []
+        for line in lines:
+            if line.strip() == "":
+                if current:
+                    blocks.append(current)
+                    current = []
+            else:
+                current.append(line.strip())
+        if current:
+            blocks.append(current)
 
-    # Both are in percent — convert to decimal
-    ff3 = ff3 / 100.0
-    mom = mom / 100.0
+        # Find the first block whose first line looks like a CSV header
+        # (contains letters) and whose data rows are 6-digit YYYYMM integers
+        data_block = None
+        for block in blocks:
+            if len(block) < 2:
+                continue
+            # Check if second row starts with a 6-digit date
+            parts = block[1].split(",")
+            if parts and re.match(r"^\d{6}$", parts[0].strip()):
+                data_block = block
+                break
+
+        if data_block is None:
+            raise ValueError(f"Could not parse factor data from {url}")
+
+        header = [h.strip() for h in data_block[0].split(",")]
+        rows = []
+        for line in data_block[1:]:
+            parts = [p.strip() for p in line.split(",")]
+            if not parts or not re.match(r"^\d{6}$", parts[0]):
+                break
+            rows.append(parts)
+
+        df = pd.DataFrame(rows, columns=header)
+        df = df.rename(columns={df.columns[0]: "Date"})
+        df["Date"] = pd.to_datetime(df["Date"], format="%Y%m")
+        # Convert to month-end
+        df["Date"] = df["Date"] + pd.offsets.MonthEnd(0)
+        df = df.set_index("Date")
+        return df.apply(pd.to_numeric, errors="coerce") / 100.0
+
+    # Fama-French 3-factor monthly
+    ff3 = _fetch_ff_zip(
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip",
+        "F-F_Research_Data_Factors.CSV",
+    )
+
+    # Momentum factor monthly
+    mom = _fetch_ff_zip(
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_CSV.zip",
+        "F-F_Momentum_Factor.CSV",
+    )
+    # Momentum column may be named "Mom   " — rename to WML
     mom.columns = ["WML"]
 
     factors = ff3.join(mom, how="inner")
-    factors.index = factors.index.to_timestamp(how="end").normalize()
+
+    # Trim to lookback window
+    cutoff = pd.Timestamp.today() - pd.DateOffset(years=lookback_years)
+    factors = factors[factors.index >= cutoff]
+
     return factors
 
 
@@ -806,7 +871,7 @@ if ff_ok:
             .set_properties(**{"text-align": "center"})
             .set_table_styles([{"selector": "th", "props": [("text-align", "center")]}])
         )
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.dataframe(styled, width='stretch', hide_index=True)
 
         # ── Portfolio summary metrics ─────────────────────────────────────────
         st.markdown("**Portfolio-level factor exposures** (market-value weighted)")
@@ -864,7 +929,7 @@ if ff_ok:
         ax_pb.grid(axis="y", linestyle="--", alpha=0.4, color=LIGHT, zorder=0)
         ax_pb.set_axisbelow(True)
         plt.tight_layout(pad=1.8)
-        st.pyplot(fig_pb, use_container_width=True)
+        st.pyplot(fig_pb, width='stretch')
         plt.close(fig_pb)
 
         # 2. Per-ticker heatmap
@@ -913,7 +978,7 @@ if ff_ok:
         )
         ax_hm.spines[:].set_visible(False)
         plt.tight_layout(pad=1.5)
-        st.pyplot(fig_hm, use_container_width=True)
+        st.pyplot(fig_hm, width='stretch')
         plt.close(fig_hm)
 
     else:
