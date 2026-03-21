@@ -4,13 +4,15 @@ Portfolio Analyzer — Streamlit App
 Upload your two Fidelity CSV exports to analyze portfolio performance.
 
 To run locally:
-    pip install streamlit yfinance matplotlib pandas
+    pip install streamlit yfinance matplotlib pandas statsmodels requests
     streamlit run app.py
 """
 
 import csv
 import io
+import io as _io
 import re
+import zipfile
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 
@@ -18,8 +20,6 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import io as _io
-import zipfile
 import requests
 import statsmodels.api as sm
 import streamlit as st
@@ -27,18 +27,10 @@ import yfinance as yf
 from matplotlib.ticker import FuncFormatter
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Page config
+# Page config & style constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-st.set_page_config(
-    page_title="Portfolio Analyzer",
-    page_icon="📈",
-    layout="wide",
-)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Style constants
-# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Portfolio Analyzer", page_icon="📈", layout="wide")
 
 BG    = "#f9fafb"
 GRAY  = "#374151"
@@ -86,11 +78,6 @@ def detect_file_type(content: str) -> str:
             return "positions"
         break
     return "positions"
-
-
-def prev_friday(d: date) -> date:
-    days_back = (d.weekday() - 4) % 7
-    return d - timedelta(days=days_back)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,6 +147,7 @@ def read_orders(content: str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_starting_portfolio(current_positions: dict, orders: list) -> dict:
+    """Reverse all orders from the current snapshot to get the pre-history state."""
     portfolio = {}
     for sym, qty in current_positions.items():
         if sym in ("CASH", "PENDING"):
@@ -175,78 +163,264 @@ def build_starting_portfolio(current_positions: dict, orders: list) -> dict:
     return {k: v for k, v in portfolio.items() if abs(v) > 1e-6}
 
 
-def apply_orders_up_to(base_portfolio: dict, orders: list, cutoff: date) -> dict:
-    portfolio = deepcopy(base_portfolio)
-    for o in orders:
-        if o["date"] > cutoff:
-            break
-        sym = o["ticker"]
-        if sym == "SPAXX":
-            continue
-        portfolio[sym] = portfolio.get(sym, 0.0) + o["quantity"]
-        portfolio["CASH"] = portfolio.get("CASH", 0.0) + o["amount"]
-    return {k: v for k, v in portfolio.items() if abs(v) > 1e-6}
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Price fetching (cached so re-runs don't re-download)
+# Price fetching
 # ─────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
-def fetch_prices(tickers: tuple, start_str: str, end_str: str) -> dict:
-    """Returns { ticker: { date: close_price } }"""
-    start = datetime.strptime(start_str, "%Y-%m-%d").date()
-    end   = datetime.strptime(end_str,   "%Y-%m-%d").date()
-
-    ticker_list = list(tickers)
-    if not ticker_list:
-        return {}
+def fetch_daily_prices(tickers: tuple, start_str: str, end_str: str) -> pd.DataFrame:
+    """
+    Download daily adjusted close prices for all tickers.
+    Returns a DataFrame with DatetimeIndex and one column per ticker.
+    """
+    if not tickers:
+        return pd.DataFrame()
 
     raw = yf.download(
-        ticker_list,
-        start=start.strftime("%Y-%m-%d"),
-        end=(end + timedelta(days=1)).strftime("%Y-%m-%d"),
+        list(tickers),
+        start=start_str,
+        end=end_str,
         interval="1d",
         auto_adjust=True,
         progress=False,
     )
-
-    prices = {t: {} for t in ticker_list}
     if raw.empty:
-        return prices
+        return pd.DataFrame()
 
-    close = raw["Close"] if len(ticker_list) > 1 else raw[["Close"]]
-    if len(ticker_list) == 1:
-        close.columns = ticker_list
+    close = raw["Close"] if len(tickers) > 1 else raw[["Close"]]
+    if len(tickers) == 1:
+        close.columns = list(tickers)
 
-    for idx_dt, row in close.iterrows():
-        d = idx_dt.date() if hasattr(idx_dt, "date") else idx_dt
-        for ticker in ticker_list:
-            val = row.get(ticker)
-            if val is not None and val == val:   # NaN check
-                prices[ticker][d] = float(val)
-
-    return prices
+    close.index = pd.to_datetime(close.index).normalize()
+    return close.sort_index()
 
 
-def get_price_on_or_before(prices_for_ticker: dict, target: date):
-    for delta in range(6):
-        d = target - timedelta(days=delta)
-        if d in prices_for_ticker:
-            return prices_for_ticker[d]
-    return None
+# ─────────────────────────────────────────────────────────────────────────────
+# Daily portfolio value series
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_daily_portfolio_series(
+    starting_portfolio: dict,
+    orders: list,
+    price_df: pd.DataFrame,
+    current_positions: dict,
+    end_date: date,
+) -> pd.Series:
+    """
+    For every trading day in price_df, compute the total portfolio value.
+
+    Holdings are updated whenever an order falls on or before each day.
+    Cash is tracked explicitly; PENDING value from the positions snapshot
+    is added as a flat constant throughout.
+
+    Returns a pd.Series indexed by date with dollar portfolio values.
+    Only dates where we can price every position are included.
+    """
+    pending = current_positions.get("PENDING", 0.0)
+
+    # Group orders by date for fast lookup
+    orders_by_date: dict[date, list] = {}
+    for o in orders:
+        orders_by_date.setdefault(o["date"], []).append(o)
+
+    # Walk through calendar days
+    trading_days = [d.date() for d in price_df.index]
+    if not trading_days:
+        return pd.Series(dtype=float)
+
+    start_day = trading_days[0]
+    end_day   = min(trading_days[-1], end_date)
+
+    # Initialise holdings from starting portfolio
+    holdings = deepcopy(starting_portfolio)  # { sym: shares, "CASH": float }
+
+    values = {}
+    for day in trading_days:
+        if day > end_day:
+            break
+
+        # Apply any orders on this date
+        if day in orders_by_date:
+            for o in orders_by_date[day]:
+                sym = o["ticker"]
+                if sym == "SPAXX":
+                    continue
+                holdings[sym] = holdings.get(sym, 0.0) + o["quantity"]
+                holdings["CASH"] = holdings.get("CASH", 0.0) + o["amount"]
+            # Remove exhausted positions
+            holdings = {k: v for k, v in holdings.items() if abs(v) > 1e-6}
+
+        # Value portfolio on this day
+        total = holdings.get("CASH", 0.0) + pending
+        all_priced = True
+        for sym, shares in holdings.items():
+            if sym == "CASH":
+                continue
+            if sym in price_df.columns:
+                price = price_df.loc[price_df.index.normalize() <= pd.Timestamp(day), sym].dropna()
+                if len(price) > 0:
+                    total += shares * float(price.iloc[-1])
+                else:
+                    all_priced = False
+            # Silently skip tickers with no price data (OTC etc.)
+
+        values[day] = total
+
+    return pd.Series(values).sort_index()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fama-French factor data
+# ─────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(show_spinner=False)
+def load_ff_factors(lookback_years: int) -> pd.DataFrame:
+    """
+    Download FF3 + momentum monthly data directly from Ken French's website.
+    Returns DataFrame indexed by month-end date with columns:
+        MKT-RF, SMB, HML, WML, RF  (decimals)
+    """
+    def _fetch_ff_zip(url: str) -> pd.DataFrame:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        with zipfile.ZipFile(_io.BytesIO(resp.content)) as zf:
+            csv_name = next(n for n in zf.namelist() if n.lower().endswith(".csv"))
+            with zf.open(csv_name) as f:
+                raw = f.read().decode("utf-8", errors="replace")
+
+        lines = raw.splitlines()
+        blocks, current = [], []
+        for line in lines:
+            if line.strip() == "":
+                if current:
+                    blocks.append(current)
+                    current = []
+            else:
+                current.append(line.strip())
+        if current:
+            blocks.append(current)
+
+        data_block = None
+        for block in blocks:
+            if len(block) < 2:
+                continue
+            parts = block[1].split(",")
+            if parts and re.match(r"^\d{6}$", parts[0].strip()):
+                data_block = block
+                break
+
+        if data_block is None:
+            raise ValueError(f"Could not parse factor data from {url}")
+
+        header = [h.strip() for h in data_block[0].split(",")]
+        rows = []
+        for line in data_block[1:]:
+            parts = [p.strip() for p in line.split(",")]
+            if not parts or not re.match(r"^\d{6}$", parts[0]):
+                break
+            rows.append(parts)
+
+        df = pd.DataFrame(rows, columns=header)
+        df = df.rename(columns={df.columns[0]: "Date"})
+        df["Date"] = pd.to_datetime(df["Date"], format="%Y%m") + pd.offsets.MonthEnd(0)
+        df = df.set_index("Date")
+        return df.apply(pd.to_numeric, errors="coerce") / 100.0
+
+    ff3 = _fetch_ff_zip(
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip"
+    )
+
+    # Normalise column names
+    rename = {}
+    for col in ff3.columns:
+        cu = col.upper().replace(" ", "")
+        if "MKT" in cu and "RF" in cu:
+            rename[col] = "MKT-RF"
+        elif cu == "SMB":
+            rename[col] = "SMB"
+        elif cu == "HML":
+            rename[col] = "HML"
+        elif cu == "RF":
+            rename[col] = "RF"
+    ff3 = ff3.rename(columns=rename)
+
+    mom = _fetch_ff_zip(
+        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_CSV.zip"
+    )
+    mom.columns = ["WML"]
+
+    factors = ff3.join(mom, how="inner")
+
+    required = {"MKT-RF", "SMB", "HML", "RF", "WML"}
+    missing_cols = required - set(factors.columns)
+    if missing_cols:
+        raise ValueError(f"FF factor data missing columns: {missing_cols}. Got: {list(factors.columns)}")
+
+    cutoff = pd.Timestamp.today() - pd.DateOffset(years=lookback_years)
+    return factors[factors.index >= cutoff]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Factor regression
+# ─────────────────────────────────────────────────────────────────────────────
+
+FACTORS       = ["MKT-RF", "SMB", "HML", "WML"]
+FACTOR_LABELS = {"MKT-RF": "Market (β)", "SMB": "SMB (Size)", "HML": "HML (Value)", "WML": "WML (Momentum)"}
+FACTOR_COLORS = {"MKT-RF": "#1d4ed8",    "SMB": "#b91c1c",    "HML": "#15803d",      "WML": "#7c3aed"}
+
+
+@st.cache_data(show_spinner=False)
+def get_monthly_returns(tickers: tuple, start_str: str, end_str: str) -> pd.DataFrame:
+    """Monthly returns from yfinance, index snapped to month-end."""
+    raw = yf.download(
+        list(tickers),
+        start=start_str,
+        end=end_str,
+        interval="1mo",
+        auto_adjust=True,
+        progress=False,
+    )
+    if raw.empty:
+        return pd.DataFrame()
+
+    close = raw["Close"] if len(tickers) > 1 else raw[["Close"]]
+    if len(tickers) == 1:
+        close.columns = list(tickers)
+
+    close.index = close.index.to_period("M").to_timestamp("M")
+    return close.pct_change().dropna(how="all")
+
+
+def run_ff_regression(excess_ret: pd.Series, factors: pd.DataFrame):
+    """OLS of excess stock returns on 4 FF factors. Returns None if < 12 obs."""
+    s = excess_ret.copy()
+    s.index = s.index.to_period("M").to_timestamp("M")
+
+    f = factors.copy()
+    f.index = f.index.to_period("M").to_timestamp("M")
+
+    combined = f.join(s.rename("r"), how="inner").dropna()
+    if len(combined) < 12:
+        return None
+
+    model = sm.OLS(combined["r"], sm.add_constant(combined[FACTORS])).fit()
+    result = {"alpha": model.params["const"], "r_squared": model.rsquared, "n_obs": len(combined)}
+    for fac in FACTORS:
+        result[fac]              = model.params[fac]
+        result[fac + "_tstat"]   = model.tvalues[fac]
+        result[fac + "_sig"]     = abs(model.tvalues[fac]) > 1.96
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Chart builders
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_growth_chart(fridays, growth_portfolio, growth_bench):
+def make_growth_chart(dates, growth_portfolio, growth_bench):
     fig, ax = plt.subplots(figsize=(13, 6))
     fig.patch.set_facecolor(BG)
     ax.set_facecolor(BG)
 
-    date_labels = list(fridays)
     series = [
         ("Portfolio",    growth_portfolio,             "#1d4ed8", 2.8, "solid"),
         ("S&P 500",      growth_bench["S&P 500"],      "#b91c1c", 1.8, "dashed"),
@@ -255,7 +429,7 @@ def make_growth_chart(fridays, growth_portfolio, growth_bench):
 
     final_vals = {}
     for label, vals, color, lw, ls in series:
-        valid_dates = [d for d, v in zip(date_labels, vals) if v is not None]
+        valid_dates = [d for d, v in zip(dates, vals) if v is not None]
         valid_vals  = [v for v in vals if v is not None]
         ax.plot(valid_dates, valid_vals, linewidth=lw, color=color,
                 label=label, linestyle=ls, zorder=3)
@@ -265,7 +439,6 @@ def make_growth_chart(fridays, growth_portfolio, growth_bench):
     ax.axhline(y=1.0, color="#9ca3af", linewidth=1, linestyle=":", zorder=1,
                label="Baseline ($1.00)")
 
-    # Staggered end-of-line labels
     sorted_finals = sorted(
         [(lbl, val, dt, col) for lbl, (val, dt, col) in final_vals.items()],
         key=lambda x: x[1],
@@ -273,10 +446,7 @@ def make_growth_chart(fridays, growth_portfolio, growth_bench):
     MIN_GAP = 0.012
     adjusted_y = []
     for i, (_, val, _, _) in enumerate(sorted_finals):
-        if i == 0:
-            adjusted_y.append(val)
-        else:
-            adjusted_y.append(max(val, adjusted_y[-1] + MIN_GAP))
+        adjusted_y.append(val if i == 0 else max(val, adjusted_y[-1] + MIN_GAP))
 
     for (lbl, val, dt, col), adj_y in zip(sorted_finals, adjusted_y):
         ax.annotate(
@@ -286,15 +456,13 @@ def make_growth_chart(fridays, growth_portfolio, growth_bench):
             textcoords="offset points",
             fontsize=9.5,
             fontweight="bold" if lbl == "Portfolio" else "normal",
-            color=col,
-            va="center",
-            annotation_clip=False,
+            color=col, va="center", annotation_clip=False,
         )
 
-    start_str = fridays[0].strftime("%B %d, %Y")
-    end_str   = fridays[-1].strftime("%B %d, %Y")
+    start_str = dates[0].strftime("%B %d, %Y") if dates else ""
+    end_str   = dates[-1].strftime("%B %d, %Y") if dates else ""
     ax.set_title(
-        "Portfolio Performance vs. Benchmarks" + "\n"
+        "Portfolio Performance vs. Benchmarks\n"
         + f"Growth of $1  \u00b7  {start_str} \u2013 {end_str}",
         fontsize=14, fontweight="bold", pad=14, loc="left", color=DARK,
     )
@@ -328,8 +496,7 @@ def make_bar_fig(title, subtitle, labels, values, colors, ylabel, figsize=(8, 5.
                     width=bar_w, edgecolor=BG, linewidth=0, zorder=3)
 
     pct_vals = [v * 100 for v in values]
-    y_min = min(pct_vals)
-    y_max = max(pct_vals)
+    y_min = min(pct_vals); y_max = max(pct_vals)
     pad   = max(abs(y_max), abs(y_min)) * 0.22 + 0.4
     ax2.set_ylim(
         y_min - pad if y_min < 0 else -pad * 0.3,
@@ -390,7 +557,7 @@ if not positions_file or not orders_file:
     st.info("Upload both files above to get started.")
     st.stop()
 
-# ── Decode and detect ─────────────────────────────────────────────────────────
+# ── Decode & detect ───────────────────────────────────────────────────────────
 contents = {}
 for f in [positions_file, orders_file]:
     content = f.read().decode("utf-8-sig")
@@ -401,11 +568,10 @@ if "positions" not in contents or "orders" not in contents:
     st.error("Could not identify both files. Make sure you upload one positions file and one order history file.")
     st.stop()
 
-pos_filename,  positions_content = contents["positions"]
-ord_filename,  orders_content    = contents["orders"]
+pos_filename, positions_content = contents["positions"]
+ord_filename, orders_content    = contents["orders"]
 
-# ── Extract end date from positions filename ───────────────────────────────────
-# Expected format: Portfolio_Positions_Mar-04-2026.csv
+# ── Extract end date from filename ────────────────────────────────────────────
 _date_match = re.search(r"(\w{3}-\d{2}-\d{4})", pos_filename)
 if _date_match:
     try:
@@ -415,26 +581,18 @@ if _date_match:
 else:
     end_date = date.today()
 
-st.success(f"Positions: **{pos_filename}**   |   Orders: **{ord_filename}**   |   End date: **{end_date.strftime('%B %d, %Y')}**")
+st.success(
+    f"Positions: **{pos_filename}**   |   Orders: **{ord_filename}**   |   "
+    f"End date: **{end_date.strftime('%B %d, %Y')}**"
+)
 
-# ── Parse ─────────────────────────────────────────────────────────────────────
+# ── Parse files ───────────────────────────────────────────────────────────────
 with st.spinner("Parsing files..."):
     current_positions     = read_positions(positions_content)
     earliest_date, orders = read_orders(orders_content)
     starting_portfolio    = build_starting_portfolio(current_positions, orders)
 
-# ── Fridays ───────────────────────────────────────────────────────────────────
-first_friday = prev_friday(earliest_date)
-fridays = []
-f = first_friday
-while f <= end_date:
-    fridays.append(f)
-    f += timedelta(weeks=1)
-if prev_friday(end_date) not in fridays:
-    fridays.append(prev_friday(end_date))
-fridays = sorted(set(fridays))
-
-# ── Fetch prices ──────────────────────────────────────────────────────────────
+# ── Collect all tickers ───────────────────────────────────────────────────────
 all_equity_tickers = set()
 for sym in current_positions:
     if sym not in ("CASH", "PENDING"):
@@ -443,48 +601,60 @@ for o in orders:
     if o["ticker"] != "SPAXX":
         all_equity_tickers.add(o["ticker"])
 
-BENCHMARKS = {"S&P 500": "^GSPC", "Russell 3000": "^RUA"}
+BENCHMARKS     = {"S&P 500": "^GSPC", "Russell 3000": "^RUA"}
 all_yf_tickers = tuple(sorted(all_equity_tickers | set(BENCHMARKS.values())))
 
-with st.spinner("Fetching price data from Yahoo Finance..."):
-    price_data = fetch_prices(
-        all_yf_tickers,
-        start_str=(first_friday - timedelta(days=7)).strftime("%Y-%m-%d"),
-        end_str=end_date.strftime("%Y-%m-%d"),
+# ── Fetch daily prices ────────────────────────────────────────────────────────
+fetch_start = (earliest_date - timedelta(days=5)).strftime("%Y-%m-%d")
+fetch_end   = (end_date      + timedelta(days=1)).strftime("%Y-%m-%d")
+
+with st.spinner("Fetching daily price data from Yahoo Finance..."):
+    price_df = fetch_daily_prices(all_yf_tickers, fetch_start, fetch_end)
+
+# ── Build daily portfolio value series ────────────────────────────────────────
+with st.spinner("Computing daily portfolio values..."):
+    portfolio_series = build_daily_portfolio_series(
+        starting_portfolio, orders, price_df, current_positions, end_date
     )
 
-# ── Weekly portfolio values ───────────────────────────────────────────────────
-weekly_values  = []
-missing_by_week = []
+if portfolio_series.empty:
+    st.error("Could not compute portfolio values. Check that price data was downloaded.")
+    st.stop()
 
-for friday in fridays:
-    port = apply_orders_up_to(starting_portfolio, orders, friday)
-    total = port.get("CASH", 0.0) + current_positions.get("PENDING", 0.0)
-    missing = []
-    for sym, shares in port.items():
-        if sym == "CASH":
-            continue
-        price = get_price_on_or_before(price_data.get(sym, {}), friday)
-        if price is None:
-            missing.append(sym)
-        else:
-            total += shares * price
-    weekly_values.append(total)
-    missing_by_week.append(missing)
+# ── Daily benchmark series ────────────────────────────────────────────────────
+bench_series = {}
+for name, sym in BENCHMARKS.items():
+    if sym in price_df.columns:
+        s = price_df[sym].dropna()
+        s = s[s.index.date <= end_date]
+        # Align to same trading days as portfolio
+        s = s[s.index.isin(portfolio_series.index.map(pd.Timestamp))]
+        bench_series[name] = s
 
-# ── Growth series ─────────────────────────────────────────────────────────────
-base_port       = weekly_values[0]
-growth_portfolio = [v / base_port for v in weekly_values]
+# ── Index all series to 1.0 at first date ────────────────────────────────────
+port_dates  = list(portfolio_series.index)       # list of date objects
+port_vals   = portfolio_series.values.tolist()
+base_port   = port_vals[0]
+growth_port = [v / base_port for v in port_vals]
 
 growth_bench = {}
-for name, sym in BENCHMARKS.items():
-    prices = price_data.get(sym, {})
-    series = [get_price_on_or_before(prices, f) for f in fridays]
-    base   = next((p for p in series if p is not None), None)
-    growth_bench[name] = [(p / base if p is not None else None) for p in series] if base else [None] * len(fridays)
+for name, s in bench_series.items():
+    base = s.iloc[0] if len(s) > 0 else None
+    if base and base > 0:
+        growth_bench[name] = (s / base).tolist()
+    else:
+        growth_bench[name] = [None] * len(s)
+
+# Pad benchmarks to same length as portfolio if needed
+for name in BENCHMARKS:
+    if name not in growth_bench:
+        growth_bench[name] = [None] * len(port_dates)
+    elif len(growth_bench[name]) < len(port_dates):
+        growth_bench[name] += [None] * (len(port_dates) - len(growth_bench[name]))
 
 # ── Return calculations ───────────────────────────────────────────────────────
-abs_return    = growth_portfolio[-1] - 1.0
+abs_return = growth_port[-1] - 1.0
+
 bench_returns = {}
 for name in BENCHMARKS:
     vals  = growth_bench[name]
@@ -497,83 +667,83 @@ excess_returns = {
     for name, br in bench_returns.items()
 }
 
-date_range_str = (fridays[0].strftime("%b %d, %Y")
-                  + " \u2013 "
-                  + fridays[-1].strftime("%b %d, %Y"))
+date_range_str = (
+    port_dates[0].strftime("%b %d, %Y")
+    + " \u2013 "
+    + port_dates[-1].strftime("%b %d, %Y")
+)
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Section 1 — Time-frame & key metrics
+# Section 1 — Overview metrics
 # ═════════════════════════════════════════════════════════════════════════════
 
 st.divider()
 st.subheader("Overview")
 
-delta_days = (end_date - earliest_date).days
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Start Date",   earliest_date.strftime("%b %d, %Y"))
-m2.metric("End Date",     end_date.strftime("%b %d, %Y"))
-m3.metric("Portfolio Return", f"{abs_return*100:+.2f}%")
-
 er_sp = excess_returns.get("S&P 500")
 er_ru = excess_returns.get("Russell 3000")
-m4.metric("vs. S&P 500",      f"{er_sp*100:+.2f}%" if er_sp is not None else "N/A")
-m5.metric("vs. Russell 3000", f"{er_ru*100:+.2f}%" if er_ru is not None else "N/A")
+
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Start Date",        earliest_date.strftime("%b %d, %Y"))
+m2.metric("End Date",          end_date.strftime("%b %d, %Y"))
+m3.metric("Portfolio Return",  f"{abs_return*100:+.2f}%")
+m4.metric("vs. S&P 500",       f"{er_sp*100:+.2f}%" if er_sp is not None else "N/A")
+m5.metric("vs. Russell 3000",  f"{er_ru*100:+.2f}%" if er_ru is not None else "N/A")
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Section 2 — Weekly portfolio values table
+# Section 2 — Daily portfolio values table
 # ═════════════════════════════════════════════════════════════════════════════
 
 st.divider()
-with st.expander("Weekly Portfolio Values", expanded=False):
-    import pandas as pd
-    rows = []
-    for friday, val, missing in zip(fridays, weekly_values, missing_by_week):
-        rows.append({
-            "Date":            friday.strftime("%b %d, %Y"),
-            "Portfolio Value": f"${val:,.2f}",
-            "Missing Prices":  ", ".join(missing) if missing else "—",
-        })
-    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+with st.expander("Daily Portfolio Values", expanded=False):
+    table_rows = [
+        {
+            "Date":            d.strftime("%b %d, %Y"),
+            "Portfolio Value": f"${v:,.2f}",
+            "Daily Return":    f"{(growth_port[i] / growth_port[i-1] - 1)*100:+.2f}%" if i > 0 else "—",
+        }
+        for i, (d, v) in enumerate(zip(port_dates, port_vals))
+    ]
+    st.dataframe(pd.DataFrame(table_rows), width="stretch", hide_index=True)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Section 3 — Current positions
 # ═════════════════════════════════════════════════════════════════════════════
 
 with st.expander("Current Positions", expanded=False):
-    import pandas as pd
     pos_rows = []
     for sym, qty in current_positions.items():
         if sym in ("CASH", "PENDING"):
             pos_rows.append({"Symbol": sym, "Quantity / Value": f"${qty:,.2f}"})
         else:
             pos_rows.append({"Symbol": sym, "Quantity / Value": f"{qty:,.4f} shares"})
-    st.dataframe(pd.DataFrame(pos_rows), width='stretch', hide_index=True)
+    st.dataframe(pd.DataFrame(pos_rows), width="stretch", hide_index=True)
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Section 4 — Order history
 # ═════════════════════════════════════════════════════════════════════════════
 
 with st.expander("Order History", expanded=False):
-    import pandas as pd
-    ord_rows = []
-    for o in reversed(orders):
-        ord_rows.append({
+    ord_rows = [
+        {
             "Date":     o["date"].strftime("%m/%d/%Y"),
             "Type":     o["type"],
             "Ticker":   o["ticker"],
             "Quantity": f"{abs(o['quantity']):,.4f}",
             "Amount":   f"${abs(o['amount']):,.2f}" if o["amount"] != 0 else "—",
-        })
-    st.dataframe(pd.DataFrame(ord_rows), width='stretch', hide_index=True)
+        }
+        for o in reversed(orders)
+    ]
+    st.dataframe(pd.DataFrame(ord_rows), width="stretch", hide_index=True)
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Section 5 — Growth of $1 chart
+# Section 5 — Growth of $1 chart (daily)
 # ═════════════════════════════════════════════════════════════════════════════
 
 st.divider()
 st.subheader("Growth of $1")
-fig_growth = make_growth_chart(fridays, growth_portfolio, growth_bench)
-st.pyplot(fig_growth, width='stretch')
+fig_growth = make_growth_chart(port_dates, growth_port, growth_bench)
+st.pyplot(fig_growth, width="stretch")
 plt.close(fig_growth)
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -583,59 +753,46 @@ plt.close(fig_growth)
 st.divider()
 st.subheader("Return Summary")
 
-# Absolute return — full width
 all_labels = ["Portfolio", "S&P 500", "Russell 3000"]
 all_rets   = [abs_return] + [bench_returns.get(n, 0) or 0 for n in ["S&P 500", "Russell 3000"]]
 all_colors = [
-    _bar_color(abs_return,                              "#1d4ed8"),
-    _bar_color(bench_returns.get("S&P 500")    or 0,   "#b91c1c"),
-    _bar_color(bench_returns.get("Russell 3000") or 0,  "#15803d"),
+    _bar_color(abs_return,                               "#1d4ed8"),
+    _bar_color(bench_returns.get("S&P 500")     or 0,   "#b91c1c"),
+    _bar_color(bench_returns.get("Russell 3000") or 0,   "#15803d"),
 ]
 fig_abs = make_bar_fig(
-    title    = "Absolute Return",
-    subtitle = date_range_str,
-    labels   = all_labels,
-    values   = all_rets,
-    colors   = all_colors,
-    ylabel   = "Total Return (%)",
-    figsize  = (9, 5.5),
+    title="Absolute Return", subtitle=date_range_str,
+    labels=all_labels, values=all_rets, colors=all_colors,
+    ylabel="Total Return (%)", figsize=(9, 5.5),
 )
-st.pyplot(fig_abs, width='stretch')
+st.pyplot(fig_abs, width="stretch")
 plt.close(fig_abs)
 
-# Excess return charts side by side
 col1, col2 = st.columns(2)
 if er_sp is not None:
     with col1:
         fig_sp = make_bar_fig(
-            title    = "Excess Return vs. S&P 500",
-            subtitle = date_range_str,
-            labels   = ["Portfolio \u2212 S&P 500"],
-            values   = [er_sp],
-            colors   = [_bar_color(er_sp, "#1d4ed8")],
-            ylabel   = "Excess Return (%)",
-            figsize  = (6, 5.5),
+            title="Excess Return vs. S&P 500", subtitle=date_range_str,
+            labels=["Portfolio \u2212 S&P 500"], values=[er_sp],
+            colors=[_bar_color(er_sp, "#1d4ed8")],
+            ylabel="Excess Return (%)", figsize=(6, 5.5),
         )
-        st.pyplot(fig_sp, width='stretch')
+        st.pyplot(fig_sp, width="stretch")
         plt.close(fig_sp)
 
 if er_ru is not None:
     with col2:
         fig_ru = make_bar_fig(
-            title    = "Excess Return vs. Russell 3000",
-            subtitle = date_range_str,
-            labels   = ["Portfolio \u2212 Russell 3000"],
-            values   = [er_ru],
-            colors   = [_bar_color(er_ru, "#1d4ed8")],
-            ylabel   = "Excess Return (%)",
-            figsize  = (6, 5.5),
+            title="Excess Return vs. Russell 3000", subtitle=date_range_str,
+            labels=["Portfolio \u2212 Russell 3000"], values=[er_ru],
+            colors=[_bar_color(er_ru, "#1d4ed8")],
+            ylabel="Excess Return (%)", figsize=(6, 5.5),
         )
-        st.pyplot(fig_ru, width='stretch')
+        st.pyplot(fig_ru, width="stretch")
         plt.close(fig_ru)
 
-
 # ═════════════════════════════════════════════════════════════════════════════
-# Section 7 — Factor Betas (Fama-French 4-Factor)
+# Section 7 — Factor Betas (Fama-French 4-Factor, 3-year monthly)
 # ═════════════════════════════════════════════════════════════════════════════
 
 st.divider()
@@ -646,184 +803,7 @@ st.markdown(
 )
 
 LOOKBACK_YEARS = 3
-FACTORS        = ["MKT-RF", "SMB", "HML", "WML"]
-FACTOR_LABELS  = {"MKT-RF": "Market (β)", "SMB": "SMB (Size)", "HML": "HML (Value)", "WML": "WML (Momentum)"}
-FACTOR_COLORS  = {"MKT-RF": "#1d4ed8", "SMB": "#b91c1c", "HML": "#15803d", "WML": "#7c3aed"}
 
-@st.cache_data(show_spinner=False)
-def load_ff_factors(lookback_years: int) -> pd.DataFrame:
-    """
-    Download Fama-French 3-factor + momentum monthly data directly from
-    Kenneth French's data library (no pandas-datareader needed).
-    Returns a DataFrame indexed by month-end date with columns:
-        MKT-RF, SMB, HML, WML, RF  (all as decimals, e.g. 0.012)
-    """
-    def _fetch_ff_zip(url: str) -> pd.DataFrame:
-        """Download a FF zip, extract the named CSV, parse the monthly table."""
-        resp = requests.get(url, timeout=30)
-        resp.raise_for_status()
-        with zipfile.ZipFile(_io.BytesIO(resp.content)) as zf:
-            # Don't hardcode the filename — just grab the first .csv/.CSV entry
-            csv_name = next(
-                n for n in zf.namelist()
-                if n.lower().endswith(".csv")
-            )
-            with zf.open(csv_name) as f:
-                raw = f.read().decode("utf-8", errors="replace")
-
-        # FF files have a header block of text, then a CSV block, then more text.
-        # The monthly data block starts after a blank line following the header
-        # and ends at the next blank line.
-        lines = raw.splitlines()
-        blocks = []
-        current = []
-        for line in lines:
-            if line.strip() == "":
-                if current:
-                    blocks.append(current)
-                    current = []
-            else:
-                current.append(line.strip())
-        if current:
-            blocks.append(current)
-
-        # Find the first block whose first line looks like a CSV header
-        # (contains letters) and whose data rows are 6-digit YYYYMM integers
-        data_block = None
-        for block in blocks:
-            if len(block) < 2:
-                continue
-            # Check if second row starts with a 6-digit date
-            parts = block[1].split(",")
-            if parts and re.match(r"^\d{6}$", parts[0].strip()):
-                data_block = block
-                break
-
-        if data_block is None:
-            raise ValueError(f"Could not parse factor data from {url}")
-
-        header = [h.strip() for h in data_block[0].split(",")]
-        rows = []
-        for line in data_block[1:]:
-            parts = [p.strip() for p in line.split(",")]
-            if not parts or not re.match(r"^\d{6}$", parts[0]):
-                break
-            rows.append(parts)
-
-        df = pd.DataFrame(rows, columns=header)
-        df = df.rename(columns={df.columns[0]: "Date"})
-        df["Date"] = pd.to_datetime(df["Date"], format="%Y%m")
-        # Convert to month-end
-        df["Date"] = df["Date"] + pd.offsets.MonthEnd(0)
-        df = df.set_index("Date")
-        return df.apply(pd.to_numeric, errors="coerce") / 100.0
-
-    # Fama-French 3-factor monthly
-    ff3 = _fetch_ff_zip(
-        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip",
-    )
-
-    # Normalise FF3 column names — French sometimes uses "Mkt-RF" or "MKT-RF"
-    # Standardise to uppercase and strip whitespace
-    ff3.columns = [c.strip().upper().replace("MKT-RF", "MKT-RF") for c in ff3.columns]
-    # Map any variant spellings to canonical names
-    ff3_rename = {}
-    for col in ff3.columns:
-        cu = col.upper().replace(" ", "")
-        if "MKT" in cu and "RF" in cu:
-            ff3_rename[col] = "MKT-RF"
-        elif cu == "SMB":
-            ff3_rename[col] = "SMB"
-        elif cu == "HML":
-            ff3_rename[col] = "HML"
-        elif cu == "RF":
-            ff3_rename[col] = "RF"
-    ff3 = ff3.rename(columns=ff3_rename)
-
-    # Momentum factor monthly
-    mom = _fetch_ff_zip(
-        "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Momentum_Factor_CSV.zip",
-    )
-    # Momentum column may be "Mom", "WML", "PR1YR", etc. — just take the first data column
-    mom.columns = ["WML"]
-
-    factors = ff3.join(mom, how="inner")
-
-    # Verify required columns are present before returning
-    required = {"MKT-RF", "SMB", "HML", "RF", "WML"}
-    missing_cols = required - set(factors.columns)
-    if missing_cols:
-        raise ValueError(
-            f"FF factor data missing expected columns: {missing_cols}. "
-            f"Got: {list(factors.columns)}"
-        )
-
-    # Trim to lookback window
-    cutoff = pd.Timestamp.today() - pd.DateOffset(years=lookback_years)
-    factors = factors[factors.index >= cutoff]
-
-    return factors
-
-
-@st.cache_data(show_spinner=False)
-def get_monthly_returns(tickers: tuple, start_str: str, end_str: str) -> pd.DataFrame:
-    """
-    Download monthly closing prices via yfinance and compute simple returns.
-    Reindexes to month-end dates to align with Fama-French factor data.
-    """
-    raw = yf.download(
-        list(tickers),
-        start=start_str,
-        end=end_str,
-        interval="1mo",
-        auto_adjust=True,
-        progress=False,
-    )
-    if raw.empty:
-        return pd.DataFrame()
-
-    close = raw["Close"] if len(tickers) > 1 else raw[["Close"]]
-    if len(tickers) == 1:
-        close.columns = list(tickers)
-
-    # yfinance monthly bars are timestamped at month-start; snap to month-end
-    # so they align with the FF factor index (which is month-end)
-    close.index = close.index.to_period("M").to_timestamp("M")
-
-    returns = close.pct_change().dropna(how="all")
-    return returns
-
-
-def run_ff_regression(excess_ret: pd.Series, factors: pd.DataFrame):
-    """
-    OLS regression of excess stock returns on the 4 Fama-French factors.
-    Both series must share a month-end DatetimeIndex.
-    Returns a result dict, or None if fewer than 12 overlapping observations.
-    """
-    # Snap both indexes to period then back to month-end to guarantee alignment
-    excess_ms = excess_ret.copy()
-    excess_ms.index = excess_ms.index.to_period("M").to_timestamp("M")
-
-    factors_ms = factors.copy()
-    factors_ms.index = factors_ms.index.to_period("M").to_timestamp("M")
-
-    combined = factors_ms.join(excess_ms.rename("r"), how="inner").dropna()
-    if len(combined) < 12:
-        return None
-
-    X = sm.add_constant(combined[FACTORS])
-    y = combined["r"]
-    model = sm.OLS(y, X).fit()
-
-    result = {"alpha": model.params["const"], "r_squared": model.rsquared, "n_obs": len(combined)}
-    for f in FACTORS:
-        result[f]           = model.params[f]
-        result[f + "_tstat"] = model.tvalues[f]
-        result[f + "_sig"]   = abs(model.tvalues[f]) > 1.96
-    return result
-
-
-# ── Load factor data ──────────────────────────────────────────────────────────
 with st.spinner("Loading Fama-French factor data..."):
     try:
         ff_factors = load_ff_factors(LOOKBACK_YEARS)
@@ -833,13 +813,11 @@ with st.spinner("Loading Fama-French factor data..."):
         ff_ok = False
 
 if ff_ok:
-    # Current equity positions only (exclude CASH and PENDING)
     equity_positions = {
         sym: qty for sym, qty in current_positions.items()
         if sym not in ("CASH", "PENDING") and qty > 0
     }
 
-    # Fetch 3 years of monthly data; add a 1-month buffer on each end
     factor_start = (ff_factors.index[0]  - pd.DateOffset(months=1)).strftime("%Y-%m-%d")
     factor_end   = (ff_factors.index[-1] + pd.DateOffset(months=2)).strftime("%Y-%m-%d")
 
@@ -850,24 +828,20 @@ if ff_ok:
             end_str   = factor_end,
         )
 
-    # Diagnostics expander — helpful if something still goes wrong
     with st.expander("Factor regression diagnostics", expanded=False):
         st.write(f"**FF factors:** {len(ff_factors)} months, "
-                 f"{ff_factors.index[0].date()} → {ff_factors.index[-1].date()}")
+                 f"{ff_factors.index[0].date()} \u2192 {ff_factors.index[-1].date()}")
         st.write(f"**FF columns:** {list(ff_factors.columns)}")
         if not monthly_rets.empty:
             st.write(f"**Monthly returns:** {len(monthly_rets)} rows, "
-                     f"{monthly_rets.index[0].date()} → {monthly_rets.index[-1].date()}")
+                     f"{monthly_rets.index[0].date()} \u2192 {monthly_rets.index[-1].date()}")
             st.write(f"**Tickers fetched:** {list(monthly_rets.columns)}")
-            # Show sample of index to confirm month-end alignment
             st.write(f"**Return index sample:** {[str(d.date()) for d in monthly_rets.index[:3]]}")
             st.write(f"**FF index sample:** {[str(d.date()) for d in ff_factors.index[:3]]}")
         else:
             st.write("**Monthly returns:** empty — yfinance returned no data")
 
-    # Run regression for each ticker
-    betas_rows = []
-    per_ticker = {}
+    betas_rows, per_ticker = [], {}
 
     for sym in sorted(equity_positions.keys()):
         if monthly_rets.empty or sym not in monthly_rets.columns:
@@ -892,16 +866,18 @@ if ff_ok:
             "Obs.":     result["n_obs"],
         })
 
-    # ── Portfolio-level weighted betas ───────────────────────────────────────
-    # Weight by current market value (shares × latest price)
-    latest_prices = {
-        sym: get_price_on_or_before(price_data.get(sym, {}), end_date)
-        for sym in equity_positions
-    }
+    # Portfolio-level weighted betas
+    latest_prices_dict = {}
+    for sym in equity_positions:
+        if sym in price_df.columns:
+            col = price_df[sym].dropna()
+            col = col[col.index.date <= end_date]
+            latest_prices_dict[sym] = float(col.iloc[-1]) if len(col) > 0 else None
+
     market_vals = {
-        sym: equity_positions[sym] * latest_prices[sym]
+        sym: equity_positions[sym] * latest_prices_dict[sym]
         for sym in equity_positions
-        if latest_prices.get(sym) and sym in per_ticker
+        if latest_prices_dict.get(sym) and sym in per_ticker
     }
     total_equity_val = sum(market_vals.values())
 
@@ -909,19 +885,17 @@ if ff_ok:
     if total_equity_val > 0:
         for sym, mv in market_vals.items():
             w = mv / total_equity_val
-            for f in FACTORS:
-                port_betas[f] += w * per_ticker[sym][f]
+            for fac in FACTORS:
+                port_betas[fac] += w * per_ticker[sym][fac]
 
-    # ── Table ─────────────────────────────────────────────────────────────────
     if betas_rows:
         df_betas = pd.DataFrame(betas_rows)
 
-        # Colour-code numeric beta columns via pandas Styler
         def _colour_beta(val):
             try:
                 v = float(val)
-                if v > 0.15:   return "color: #15803d; font-weight:600"
-                if v < -0.15:  return "color: #b91c1c; font-weight:600"
+                if v > 0.15:  return "color: #15803d; font-weight:600"
+                if v < -0.15: return "color: #b91c1c; font-weight:600"
             except (TypeError, ValueError):
                 pass
             return "color: #374151"
@@ -932,25 +906,21 @@ if ff_ok:
             .set_properties(**{"text-align": "center"})
             .set_table_styles([{"selector": "th", "props": [("text-align", "center")]}])
         )
-        st.dataframe(styled, width='stretch', hide_index=True)
+        st.dataframe(styled, width="stretch", hide_index=True)
 
-        # ── Portfolio summary metrics ─────────────────────────────────────────
         st.markdown("**Portfolio-level factor exposures** (market-value weighted)")
         mc1, mc2, mc3, mc4 = st.columns(4)
-        factor_meta = [
-            ("MKT-RF", "Market β",     mc1),
-            ("SMB",    "SMB",          mc2),
-            ("HML",    "HML",          mc3),
-            ("WML",    "WML (Mom.)",   mc4),
-        ]
-        for fkey, flabel, col in factor_meta:
-            val = port_betas[fkey]
-            col.metric(flabel, f"{val:+.3f}")
+        for fkey, flabel, col in [
+            ("MKT-RF", "Market β",   mc1),
+            ("SMB",    "SMB",        mc2),
+            ("HML",    "HML",        mc3),
+            ("WML",    "WML (Mom.)", mc4),
+        ]:
+            col.metric(flabel, f"{port_betas[fkey]:+.3f}")
 
-        # ── Visualisation ─────────────────────────────────────────────────────
         st.markdown("---")
 
-        # 1. Portfolio beta bar chart
+        # Portfolio beta bar chart
         fig_pb, ax_pb = plt.subplots(figsize=(8, 4))
         fig_pb.patch.set_facecolor(BG)
         ax_pb.set_facecolor(BG)
@@ -977,7 +947,7 @@ if ff_ok:
 
         ax_pb.axhline(0, color=LIGHT, linewidth=1.2, zorder=2)
         ax_pb.set_title(
-            "Portfolio Factor Exposures" + "\n" + "Market-value weighted betas",
+            "Portfolio Factor Exposures\nMarket-value weighted betas",
             fontsize=13, fontweight="bold", pad=12, loc="left", color=DARK,
         )
         ax_pb.set_ylabel("Beta", fontsize=10.5, color=GRAY, labelpad=8)
@@ -990,10 +960,10 @@ if ff_ok:
         ax_pb.grid(axis="y", linestyle="--", alpha=0.4, color=LIGHT, zorder=0)
         ax_pb.set_axisbelow(True)
         plt.tight_layout(pad=1.8)
-        st.pyplot(fig_pb, width='stretch')
+        st.pyplot(fig_pb, width="stretch")
         plt.close(fig_pb)
 
-        # 2. Per-ticker heatmap
+        # Per-ticker heatmap
         st.markdown("**Per-position factor betas**")
         hm_data = df_betas.set_index("Ticker")[["Market β", "SMB", "HML", "WML"]].astype(float)
 
@@ -1004,14 +974,15 @@ if ff_ok:
         fig_hm.patch.set_facecolor(BG)
         ax_hm.set_facecolor(BG)
 
-        mat    = hm_data.values
-        vmax   = np.percentile(np.abs(mat[~np.isnan(mat)]), 95) if mat.size else 1
-        im     = ax_hm.imshow(mat, cmap="RdYlGn", aspect="auto",
-                               vmin=-vmax, vmax=vmax)
+        mat  = hm_data.values
+        vmax = np.percentile(np.abs(mat[~np.isnan(mat)]), 95) if mat.size else 1
+        im   = ax_hm.imshow(mat, cmap="RdYlGn", aspect="auto", vmin=-vmax, vmax=vmax)
 
+        col_label_map = {
+            "Market β": "Market (β)", "SMB": "SMB (Size)",
+            "HML": "HML (Value)", "WML": "WML (Momentum)"
+        }
         ax_hm.set_xticks(range(len(hm_data.columns)))
-        col_label_map = {"Market β": "Market (β)", "SMB": "SMB (Size)",
-                             "HML": "HML (Value)", "WML": "WML (Momentum)"}
         ax_hm.set_xticklabels(
             [col_label_map.get(c, c) for c in hm_data.columns],
             fontsize=10.5, color=DARK, fontweight="semibold"
@@ -1033,13 +1004,13 @@ if ff_ok:
         cbar.outline.set_edgecolor(LIGHT)
 
         ax_hm.set_title(
-            "Factor Beta Heatmap  ·  Per Position" + "\n"
-            + f"3-year monthly regression  ·  Green = positive exposure, Red = negative",
+            "Factor Beta Heatmap  \u00b7  Per Position\n"
+            "3-year monthly regression  \u00b7  Green = positive, Red = negative",
             fontsize=12, fontweight="bold", pad=12, loc="left", color=DARK,
         )
         ax_hm.spines[:].set_visible(False)
         plt.tight_layout(pad=1.5)
-        st.pyplot(fig_hm, width='stretch')
+        st.pyplot(fig_hm, width="stretch")
         plt.close(fig_hm)
 
     else:
