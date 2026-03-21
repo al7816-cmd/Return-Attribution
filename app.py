@@ -621,46 +621,48 @@ if portfolio_series.empty:
     st.error("Could not compute portfolio values. Check that price data was downloaded.")
     st.stop()
 
-# ── Daily benchmark series ────────────────────────────────────────────────────
-bench_series = {}
+# ── Align portfolio and benchmarks to shared trading days ────────────────────
+# Convert portfolio index (date objects) to Timestamps for pandas alignment
+port_ts = pd.Series(
+    portfolio_series.values,
+    index=pd.to_datetime(list(portfolio_series.index)),
+)
+
+# Pull benchmark prices on the exact same trading days as the portfolio
+bench_ts = {}
 for name, sym in BENCHMARKS.items():
     if sym in price_df.columns:
-        s = price_df[sym].dropna()
-        s = s[s.index.date <= end_date]
-        # Align to same trading days as portfolio
-        s = s[s.index.isin(portfolio_series.index.map(pd.Timestamp))]
-        bench_series[name] = s
+        b = price_df[sym].reindex(port_ts.index)   # NaN where market closed
+        b = b.ffill()                               # fill holidays with prior close
+        bench_ts[name] = b
 
-# ── Index all series to 1.0 at first date ────────────────────────────────────
-port_dates  = list(portfolio_series.index)       # list of date objects
-port_vals   = portfolio_series.values.tolist()
+# ── Index everything to 1.0 on the first day ─────────────────────────────────
+port_dates  = [d.date() for d in port_ts.index]
+port_vals   = port_ts.values.tolist()
 base_port   = port_vals[0]
 growth_port = [v / base_port for v in port_vals]
 
 growth_bench = {}
-for name, s in bench_series.items():
-    base = s.iloc[0] if len(s) > 0 else None
-    if base and base > 0:
-        growth_bench[name] = (s / base).tolist()
+for name, b in bench_ts.items():
+    base = b.iloc[0]
+    if pd.notna(base) and base > 0:
+        growth_bench[name] = (b / base).tolist()
     else:
-        growth_bench[name] = [None] * len(s)
+        growth_bench[name] = [None] * len(port_dates)
 
-# Pad benchmarks to same length as portfolio if needed
+# Fill in any missing benchmarks
 for name in BENCHMARKS:
     if name not in growth_bench:
         growth_bench[name] = [None] * len(port_dates)
-    elif len(growth_bench[name]) < len(port_dates):
-        growth_bench[name] += [None] * (len(port_dates) - len(growth_bench[name]))
 
 # ── Return calculations ───────────────────────────────────────────────────────
 abs_return = growth_port[-1] - 1.0
 
 bench_returns = {}
-for name in BENCHMARKS:
-    vals  = growth_bench[name]
-    first = next((v for v in vals if v is not None), None)
-    last  = next((v for v in reversed(vals) if v is not None), None)
-    bench_returns[name] = (last / first - 1.0) if (first and last) else None
+for name, b in bench_ts.items():
+    base = b.iloc[0]
+    last = b.iloc[-1]
+    bench_returns[name] = (float(last) / float(base) - 1.0) if pd.notna(base) and pd.notna(last) and base > 0 else None
 
 excess_returns = {
     name: (abs_return - br) if br is not None else None
