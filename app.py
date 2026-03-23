@@ -834,12 +834,15 @@ def get_monthly_returns(tickers: tuple, start_str: str, end_str: str) -> pd.Data
 
 
 def run_factor_regression_daily(stock_ret: pd.Series, factors: pd.DataFrame):
-    stock_ret = stock_ret.copy()
+    if isinstance(stock_ret, pd.DataFrame):
+        stock_ret = stock_ret.iloc[:, 0]
+    stock_ret = pd.to_numeric(stock_ret, errors="coerce").dropna()
     stock_ret.index = pd.to_datetime(stock_ret.index).tz_localize(None)
     factors = factors.copy()
     factors.index = pd.to_datetime(factors.index).tz_localize(None)
     combined = factors.join(stock_ret.rename("r"), how="inner").dropna()
     combined = combined.iloc[-LOOKBACK_DAYS:]
+    combined = combined.astype(float)
 
     if len(combined) < 60:  # require some minimum
         return None
