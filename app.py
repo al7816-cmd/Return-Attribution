@@ -641,14 +641,28 @@ if er_ru is not None:
 st.divider()
 st.subheader("Factor Betas")
 st.markdown(
-    "4-factor regression (MKT, SMB, HML, WML) for each current equity position "
-    "and the portfolio as a whole. Uses 3 years of monthly returns."
+    "4-factor regression (Market, Value, Momentum, Growth) for each current equity position "
+    "and the portfolio as a whole. Uses trailing 6-month daily returns with custom factor data."
 )
 
-LOOKBACK_YEARS = 3
-FACTORS        = ["MKT-RF", "SMB", "HML", "WML"]
-FACTOR_LABELS  = {"MKT-RF": "Market (β)", "SMB": "SMB (Size)", "HML": "HML (Value)", "WML": "WML (Momentum)"}
-FACTOR_COLORS  = {"MKT-RF": "#1d4ed8", "SMB": "#b91c1c", "HML": "#15803d", "WML": "#7c3aed"}
+# LOOKBACK_YEARS = 3
+# FACTORS        = ["MKT-RF", "SMB", "HML", "WML"]
+# FACTOR_LABELS  = {"MKT-RF": "Market (β)", "SMB": "SMB (Size)", "HML": "HML (Value)", "WML": "WML (Momentum)"}
+# FACTOR_COLORS  = {"MKT-RF": "#1d4ed8", "SMB": "#b91c1c", "HML": "#15803d", "WML": "#7c3aed"}
+FACTORS        = ["MKT", "VALUE", "MOMENTUM", "GROWTH"]
+FACTOR_LABELS  = {"MKT": "Market (β)", "GROWTH": "Growth", "VALUE": "HML (Value)", "MOMENTUM": "WML (Momentum)"}
+FACTOR_COLORS  = {"MKT": "#1d4ed8", "GROWTH": "#b91c1c", "VALUE": "#15803d", "MOMENTUM": "#7c3aed"}
+LOOKBACK_DAYS  = 126  # ~6 months
+
+
+@st.cache_data(show_spinner=False)
+def load_custom_factors():
+    df = pd.read_pickle("data.pk")
+    df.index = pd.to_datetime(df['datadate'])
+    df = df.drop(columns={'datadate'})
+    df = df.sort_index()
+    df = df.rename(columns={'mkt':'MKT', 'value':'VALUE', 'growth':'GROWTH', 'momentum':'MOMENTUM'})
+    return df
 
 @st.cache_data(show_spinner=False)
 def load_ff_factors(lookback_years: int) -> pd.DataFrame:
@@ -764,6 +778,27 @@ def load_ff_factors(lookback_years: int) -> pd.DataFrame:
 
     return factors
 
+@st.cache_data(show_spinner=False)
+def get_daily_returns(tickers, start_str, end_str):
+    raw = yf.download(
+        list(tickers),
+        start=start_str,
+        end=end_str,
+        interval="1d",
+        auto_adjust=True,
+        progress=False,
+    )
+
+    if raw.empty:
+        return pd.DataFrame()
+
+    close = raw["Close"] if len(tickers) > 1 else raw[["Close"]]
+    if len(tickers) == 1:
+        close.columns = list(tickers)
+
+    returns = close.pct_change().dropna(how="all")
+    return returns
+
 
 @st.cache_data(show_spinner=False)
 def get_monthly_returns(tickers: tuple, start_str: str, end_str: str) -> pd.DataFrame:
@@ -794,6 +829,29 @@ def get_monthly_returns(tickers: tuple, start_str: str, end_str: str) -> pd.Data
     return returns
 
 
+def run_factor_regression_daily(stock_ret: pd.Series, factors: pd.DataFrame):
+    combined = factors.join(stock_ret.rename("r"), how="inner").dropna()
+    # combined = combined.iloc[-LOOKBACK_DAYS:]
+
+    if len(combined) < 60:  # require some minimum
+        return None
+
+    X = sm.add_constant(combined[FACTORS])
+    y = combined["r"]
+
+    model = sm.OLS(y, X).fit()
+
+    result = {
+        "alpha": model.params["const"],
+        "r_squared": model.rsquared,
+        "n_obs": len(combined),
+    }
+
+    for f in FACTORS:
+        result[f] = model.params[f]
+
+    return result
+
 def run_ff_regression(excess_ret: pd.Series, factors: pd.DataFrame):
     """
     OLS regression of excess stock returns on the 4 Fama-French factors.
@@ -823,77 +881,54 @@ def run_ff_regression(excess_ret: pd.Series, factors: pd.DataFrame):
     return result
 
 
-# ── Load factor data ──────────────────────────────────────────────────────────
-with st.spinner("Loading Fama-French factor data..."):
+# ── Load custom factor data ───────────────────────────────────────────────────
+with st.spinner("Loading custom factor data..."):
     try:
-        ff_factors = load_ff_factors(LOOKBACK_YEARS)
-        ff_ok = True
+        custom_factors = load_custom_factors()
+        factors_ok = True
     except Exception as e:
-        st.warning(f"Could not load Fama-French data: {e}")
-        ff_ok = False
+        st.warning(f"Could not load custom factor data: {e}")
+        factors_ok = False
 
-if ff_ok:
-    # Current equity positions only (exclude CASH and PENDING)
+if factors_ok:
     equity_positions = {
         sym: qty for sym, qty in current_positions.items()
         if sym not in ("CASH", "PENDING") and qty > 0
     }
 
-    # Fetch 3 years of monthly data; add a 1-month buffer on each end
-    factor_start = (ff_factors.index[0]  - pd.DateOffset(months=1)).strftime("%Y-%m-%d")
-    factor_end   = (ff_factors.index[-1] + pd.DateOffset(months=2)).strftime("%Y-%m-%d")
+    factor_start = (custom_factors.index[0] - pd.DateOffset(days=1)).strftime("%Y-%m-%d")
+    factor_end   = (custom_factors.index[-1] + pd.DateOffset(days=1)).strftime("%Y-%m-%d")
 
-    with st.spinner("Fetching monthly price history for factor regressions..."):
-        monthly_rets = get_monthly_returns(
+    with st.spinner("Fetching daily price history for factor regressions..."):
+        daily_rets = get_daily_returns(
             tickers   = tuple(sorted(equity_positions.keys())),
             start_str = factor_start,
             end_str   = factor_end,
         )
-
-    # Diagnostics expander — helpful if something still goes wrong
-    with st.expander("Factor regression diagnostics", expanded=False):
-        st.write(f"**FF factors:** {len(ff_factors)} months, "
-                 f"{ff_factors.index[0].date()} → {ff_factors.index[-1].date()}")
-        st.write(f"**FF columns:** {list(ff_factors.columns)}")
-        if not monthly_rets.empty:
-            st.write(f"**Monthly returns:** {len(monthly_rets)} rows, "
-                     f"{monthly_rets.index[0].date()} → {monthly_rets.index[-1].date()}")
-            st.write(f"**Tickers fetched:** {list(monthly_rets.columns)}")
-            # Show sample of index to confirm month-end alignment
-            st.write(f"**Return index sample:** {[str(d.date()) for d in monthly_rets.index[:3]]}")
-            st.write(f"**FF index sample:** {[str(d.date()) for d in ff_factors.index[:3]]}")
-        else:
-            st.write("**Monthly returns:** empty — yfinance returned no data")
 
     # Run regression for each ticker
     betas_rows = []
     per_ticker = {}
 
     for sym in sorted(equity_positions.keys()):
-        if monthly_rets.empty or sym not in monthly_rets.columns:
+        if daily_rets.empty or sym not in daily_rets.columns:
             continue
-        stock_ret = monthly_rets[sym].dropna()
-        rf        = ff_factors["RF"].copy()
-        rf.index  = rf.index.to_period("M").to_timestamp("M")
-        rf        = rf.reindex(stock_ret.index)
-        excess    = (stock_ret - rf).dropna()
-        result    = run_ff_regression(excess, ff_factors)
+        result = run_factor_regression_daily(daily_rets[sym].dropna(), custom_factors)
         if result is None:
             continue
         per_ticker[sym] = result
         betas_rows.append({
-            "Ticker":   sym,
-            "Market β": round(result["MKT-RF"], 3),
-            "SMB":      round(result["SMB"],    3),
-            "HML":      round(result["HML"],    3),
-            "WML":      round(result["WML"],    3),
-            "α (mo.)":  f"{result['alpha']*100:+.2f}%",
-            "R²":       f"{result['r_squared']:.2f}",
-            "Obs.":     result["n_obs"],
+            "Ticker":    sym,
+            "Market β":  round(result["MKT"],      3),
+            "Value":     round(result["VALUE"],     3),
+            "Momentum":  round(result["MOMENTUM"],  3),
+            "Growth":    round(result["GROWTH"],    3),
+            "α (daily)": f"{result['alpha']*100:+.3f}%",
+            "R²":        f"{result['r_squared']:.2f}",
+            "Obs.":      result["n_obs"],
         })
 
     # ── Portfolio-level weighted betas ───────────────────────────────────────
-    # Weight by current market value (shares × latest price)
     latest_prices = {
         sym: get_price_on_or_before(price_data.get(sym, {}), end_date)
         for sym in equity_positions
@@ -916,19 +951,19 @@ if ff_ok:
     if betas_rows:
         df_betas = pd.DataFrame(betas_rows)
 
-        # Colour-code numeric beta columns via pandas Styler
         def _colour_beta(val):
             try:
                 v = float(val)
-                if v > 0.15:   return "color: #15803d; font-weight:600"
-                if v < -0.15:  return "color: #b91c1c; font-weight:600"
+                if v > 0.15:  return "color: #15803d; font-weight:600"
+                if v < -0.15: return "color: #b91c1c; font-weight:600"
             except (TypeError, ValueError):
                 pass
             return "color: #374151"
 
+        beta_cols = ["Market β", "Value", "Momentum", "Growth"]
         styled = (
             df_betas.style
-            .applymap(_colour_beta, subset=["Market β", "SMB", "HML", "WML"])
+            .applymap(_colour_beta, subset=beta_cols)
             .set_properties(**{"text-align": "center"})
             .set_table_styles([{"selector": "th", "props": [("text-align", "center")]}])
         )
@@ -938,14 +973,13 @@ if ff_ok:
         st.markdown("**Portfolio-level factor exposures** (market-value weighted)")
         mc1, mc2, mc3, mc4 = st.columns(4)
         factor_meta = [
-            ("MKT-RF", "Market β",     mc1),
-            ("SMB",    "SMB",          mc2),
-            ("HML",    "HML",          mc3),
-            ("WML",    "WML (Mom.)",   mc4),
+            ("MKT",      "Market β",  mc1),
+            ("VALUE",    "Value",     mc2),
+            ("MOMENTUM", "Momentum",  mc3),
+            ("GROWTH",   "Growth",    mc4),
         ]
         for fkey, flabel, col in factor_meta:
-            val = port_betas[fkey]
-            col.metric(flabel, f"{val:+.3f}")
+            col.metric(flabel, f"{port_betas[fkey]:+.3f}")
 
         # ── Visualisation ─────────────────────────────────────────────────────
         st.markdown("---")
@@ -977,7 +1011,7 @@ if ff_ok:
 
         ax_pb.axhline(0, color=LIGHT, linewidth=1.2, zorder=2)
         ax_pb.set_title(
-            "Portfolio Factor Exposures" + "\n" + "Market-value weighted betas",
+            "Portfolio Factor Exposures" + "\n" + "Market-value weighted betas  ·  Trailing 6-month daily regression",
             fontsize=13, fontweight="bold", pad=12, loc="left", color=DARK,
         )
         ax_pb.set_ylabel("Beta", fontsize=10.5, color=GRAY, labelpad=8)
@@ -995,7 +1029,7 @@ if ff_ok:
 
         # 2. Per-ticker heatmap
         st.markdown("**Per-position factor betas**")
-        hm_data = df_betas.set_index("Ticker")[["Market β", "SMB", "HML", "WML"]].astype(float)
+        hm_data = df_betas.set_index("Ticker")[beta_cols].astype(float)
 
         fig_hm, ax_hm = plt.subplots(
             figsize=(max(7, len(hm_data.columns) * 1.6),
@@ -1004,16 +1038,13 @@ if ff_ok:
         fig_hm.patch.set_facecolor(BG)
         ax_hm.set_facecolor(BG)
 
-        mat    = hm_data.values
-        vmax   = np.percentile(np.abs(mat[~np.isnan(mat)]), 95) if mat.size else 1
-        im     = ax_hm.imshow(mat, cmap="RdYlGn", aspect="auto",
-                               vmin=-vmax, vmax=vmax)
+        mat  = hm_data.values
+        vmax = np.percentile(np.abs(mat[~np.isnan(mat)]), 95) if mat.size else 1
+        im   = ax_hm.imshow(mat, cmap="RdYlGn", aspect="auto", vmin=-vmax, vmax=vmax)
 
         ax_hm.set_xticks(range(len(hm_data.columns)))
-        col_label_map = {"Market β": "Market (β)", "SMB": "SMB (Size)",
-                             "HML": "HML (Value)", "WML": "WML (Momentum)"}
         ax_hm.set_xticklabels(
-            [col_label_map.get(c, c) for c in hm_data.columns],
+            [FACTOR_LABELS.get(c, c) for c in ["MKT", "VALUE", "MOMENTUM", "GROWTH"]],
             fontsize=10.5, color=DARK, fontweight="semibold"
         )
         ax_hm.set_yticks(range(len(hm_data.index)))
@@ -1034,7 +1065,7 @@ if ff_ok:
 
         ax_hm.set_title(
             "Factor Beta Heatmap  ·  Per Position" + "\n"
-            + f"3-year monthly regression  ·  Green = positive exposure, Red = negative",
+            + "Trailing 6-month daily regression  ·  Green = positive exposure, Red = negative",
             fontsize=12, fontweight="bold", pad=12, loc="left", color=DARK,
         )
         ax_hm.spines[:].set_visible(False)
