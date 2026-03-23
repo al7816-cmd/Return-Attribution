@@ -658,10 +658,14 @@ LOOKBACK_DAYS  = 126  # ~6 months
 @st.cache_data(show_spinner=False)
 def load_custom_factors():
     df = pd.read_pickle("data.pk")
-    df.index = pd.to_datetime(df.index)
-    # df = df.drop(columns={'datadate'})
+    if 'datadate' in df.columns:
+        df.index = pd.to_datetime(df['datadate'])
+        df = df.drop(columns=['datadate'])
+    else:
+        df.index = pd.to_datetime(df.index)
     df = df.sort_index()
     df = df.rename(columns={'mkt':'MKT', 'value':'VALUE', 'growth':'GROWTH', 'momentum':'MOMENTUM'})
+    df = df[['MKT', 'VALUE', 'GROWTH', 'MOMENTUM']].apply(pd.to_numeric, errors='coerce').dropna()
     return df
 
 @st.cache_data(show_spinner=False)
