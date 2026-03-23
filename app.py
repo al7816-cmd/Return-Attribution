@@ -658,8 +658,8 @@ LOOKBACK_DAYS  = 126  # ~6 months
 @st.cache_data(show_spinner=False)
 def load_custom_factors():
     df = pd.read_pickle("data.pk")
-    df.index = pd.to_datetime(df['datadate'])
-    df = df.drop(columns={'datadate'})
+    df.index = pd.to_datetime(df.index)
+    # df = df.drop(columns={'datadate'})
     df = df.sort_index()
     df = df.rename(columns={'mkt':'MKT', 'value':'VALUE', 'growth':'GROWTH', 'momentum':'MOMENTUM'})
     return df
@@ -831,7 +831,7 @@ def get_monthly_returns(tickers: tuple, start_str: str, end_str: str) -> pd.Data
 
 def run_factor_regression_daily(stock_ret: pd.Series, factors: pd.DataFrame):
     combined = factors.join(stock_ret.rename("r"), how="inner").dropna()
-    # combined = combined.iloc[-LOOKBACK_DAYS:]
+    combined = combined.iloc[-LOOKBACK_DAYS:]
 
     if len(combined) < 60:  # require some minimum
         return None
