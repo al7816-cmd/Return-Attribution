@@ -830,6 +830,10 @@ def get_monthly_returns(tickers: tuple, start_str: str, end_str: str) -> pd.Data
 
 
 def run_factor_regression_daily(stock_ret: pd.Series, factors: pd.DataFrame):
+    stock_ret = stock_ret.copy()
+    stock_ret.index = pd.to_datetime(stock_ret.index).tz_localize(None)
+    factors = factors.copy()
+    factors.index = pd.to_datetime(factors.index).tz_localize(None)
     combined = factors.join(stock_ret.rename("r"), how="inner").dropna()
     combined = combined.iloc[-LOOKBACK_DAYS:]
 
