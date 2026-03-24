@@ -832,8 +832,7 @@ def get_monthly_returns(tickers: tuple, start_str: str, end_str: str) -> pd.Data
     returns = close.pct_change().dropna(how="all")
     return returns
 
-
-def run_factor_regression_daily(stock_ret: pd.Series, factors: pd.DataFrame):
+def run_factor_regression_daily(stock_ret: pd.Series, factors: pd.DataFrame, as_of: pd.Timestamp):
     if isinstance(stock_ret, pd.DataFrame):
         stock_ret = stock_ret.iloc[:, 0]
     stock_ret = pd.to_numeric(stock_ret, errors="coerce").dropna()
@@ -841,6 +840,7 @@ def run_factor_regression_daily(stock_ret: pd.Series, factors: pd.DataFrame):
     factors = factors.copy()
     factors.index = pd.to_datetime(factors.index).tz_localize(None)
     combined = factors.join(stock_ret.rename("r"), how="inner").dropna()
+    combined = combined[combined.index <= as_of]
     combined = combined.iloc[-LOOKBACK_DAYS:]
     combined = combined.astype(float)
 
@@ -924,7 +924,7 @@ if factors_ok:
     for sym in sorted(equity_positions.keys()):
         if daily_rets.empty or sym not in daily_rets.columns:
             continue
-        result = run_factor_regression_daily(daily_rets[sym].dropna(), custom_factors)
+        result = run_factor_regression_daily(daily_rets[sym].dropna(), custom_factors, pd.Timestamp(end_date))
         if result is None:
             continue
         per_ticker[sym] = result
