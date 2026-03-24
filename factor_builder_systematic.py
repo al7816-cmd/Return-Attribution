@@ -12,7 +12,7 @@ now = datetime.datetime.now()
 DEFAULT_STARTING_DATE = (now - datetime.timedelta(days=3*366)).strftime('%Y-%m-%d')
 
 # FILL IN WITH YOUR OWN USERNAME 
-CONN = wrds.Connection(wrds_username = 'willwu24')
+CONN = wrds.Connection(wrds_username = 'kathyyang')
 
 # for now, based on current sp500 constituents; need to coordinate with CRSP data to make fuller list. comprehensive list of inclusion/exclusion in S&P500 is not fully available.
 """
