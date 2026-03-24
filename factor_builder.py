@@ -386,14 +386,14 @@ def save_factors():
     factors = factors.merge(value, how='inner', left_on='datadate', right_on='datadate')
     factors = factors.merge(returns_mkt, how='inner', left_on='datadate', right_index=True)
 
-    factors.to_pickle('data/data.pk')
-    factors.to_csv('data/data.csv')
+    factors.to_pickle('data.pk')
+    factors.to_csv('data.csv')
 
 if __name__ == '__main__':
     save_factors()
 
-    os.system("git add data/data.pk")
-    os.system("git add data/data.csv")
+    os.system("git add data.pk")
+    os.system("git add data.csv")
     os.system("git add cron.log")
     os.system('git commit -m "auto update data"')
     os.system("git push")
